@@ -16,6 +16,9 @@ included.
 - The server address is entered on first launch and can be changed at any time
 - Automatic reconnect that restores the session and the current call state
 
+
+| <img width="250" src="https://github.com/user-attachments/assets/842f9d8c-aabd-4779-8d0b-a71cdc734deb" /> | <img width="250" src="https://github.com/user-attachments/assets/cd7ebec1-27e1-4b9c-9094-0d104b4bb79e" /> | <img width="250" src="https://github.com/user-attachments/assets/3334a7e3-ad63-4981-9b46-658412cfc782" /> |
+
 ## Requirements
 
 - Flutter 3.35 or newer, developed against 3.47
