@@ -1,0 +1,388 @@
+name: Android
+
+# builds the release APK, attaches it to the GitHub release for a v* tag, and publishes it into
+# the F-Droid repository that the same run pushes to GitHub. The F-Droid repository is a plain
+# branch of a repository (this one by default) served by GitHub Pages, so its index is signed
+# with the repository key and every APK it lists is signed with the app key.
+#
+# required repository secrets, see docs/fdroid-repo.md for the commands that create them:
+#   ANDROID_KEYSTORE_BASE64      base64 of the app signing keystore
+#   ANDROID_KEYSTORE_PASSWORD    its store password
+#   ANDROID_KEY_ALIAS            its key alias
+#   ANDROID_KEY_PASSWORD         that key's password
+#   FDROID_KEYSTORE_BASE64       base64 of the F-Droid repository signing keystore
+#   FDROID_KEYSTORE_PASSWORD     its store password
+#   FDROID_KEY_ALIAS             its key alias, defaults to sharkord
+#   FDROID_KEY_PASSWORD          that key's password, defaults to the store password
+#   FDROID_REPO_TOKEN            optional token with write access to the F-Droid repository,
+#                                only needed when it is not this repository
+# optional repository variables:
+#   FDROID_REPO                  owner/name of the F-Droid repository, defaults to <owner>/fdroid
+#   FDROID_REPO_BRANCH           branch it is served from, defaults to gh-pages
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish_to_fdroid:
+        description: Publish the built APK to the F-Droid repository
+        type: boolean
+        default: false
+      version_name:
+        description: versionName override, empty takes it from pubspec.yaml
+        type: string
+        default: ''
+      version_code:
+        description: versionCode override, empty uses the workflow run number
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  apk:
+    name: Release APK
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      version_code: ${{ steps.version.outputs.version_code }}
+      apk_name: ${{ steps.version.outputs.apk_name }}
+      signed: ${{ steps.signing.outputs.signed }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          version_name="$INPUT_VERSION_NAME"
+          version_code="$INPUT_VERSION_CODE"
+
+          if [[ -z "$version_name" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            version_name="${GITHUB_REF_NAME#v}"
+          fi
+
+          if [[ -z "$version_name" ]]; then
+            version_name="$(sed -n 's/^version:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' pubspec.yaml | head -1)"
+          fi
+
+          if [[ -z "$version_code" ]]; then
+            # the run number only ever grows, which is what an F-Droid repository needs to see
+            # a new release. The versionCode in pubspec.yaml would stay at 1 forever otherwise.
+            version_code="$GITHUB_RUN_NUMBER"
+          fi
+
+          {
+            echo "version_name=$version_name"
+            echo "version_code=$version_code"
+            echo "apk_name=sharkord-${version_name}-${version_code}.apk"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # pinned, because the project is developed against this exact stable release and the
+          # Android toolchain around it moves with it
+          flutter-version: 3.47.6
+          channel: stable
+          cache: true
+
+      # the gradle wrapper itself is not committed (flutter regenerates it), so the cache is keyed
+      # on the distribution the wrapper properties pin instead of on gradlew
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/wrapper/gradle-wrapper.properties', 'android/**/*.gradle.kts') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Fetch the dependencies
+        run: flutter pub get
+
+      - name: Analyze and test
+        run: |
+          flutter analyze
+          flutter test
+
+      - name: Decode the release keystore
+        id: signing
+        run: |
+          set -euo pipefail
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" ]]; then
+            # forks never see the secrets, so the build still runs and only the publishing jobs
+            # that need a stable signature are skipped
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set, signing with the debug key"
+            exit 0
+          fi
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/keystore.jks
+          printf 'storeFile=keystore.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" \
+            > android/key.properties
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build the release APK
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          APK_NAME: ${{ steps.version.outputs.apk_name }}
+        run: |
+          set -euo pipefail
+          flutter build apk --release --build-name "$VERSION_NAME" --build-number "$VERSION_CODE"
+          mkdir -p dist
+          # the file name flutter writes depends on the toolchain, so take the newest release
+          # build rather than assuming it is always app-release.apk
+          apk="$(ls -t build/app/outputs/flutter-apk/*.apk | grep -v -- '-debug.apk' | head -1)"
+          cp "$apk" "dist/$APK_NAME"
+          cd dist
+          sha256sum "$APK_NAME" > "$APK_NAME.sha256"
+          cat "$APK_NAME.sha256"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Summarise
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.version_code }}
+          APK_NAME: ${{ steps.version.outputs.apk_name }}
+        run: |
+          {
+            echo "### Sharkord $VERSION_NAME ($VERSION_CODE)"
+            echo
+            echo "\`$APK_NAME\`, signed: ${{ steps.signing.outputs.signed }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: GitHub release
+    needs: apk
+    # a tag without a real signature is not a release anyone should install
+    if: startsWith(github.ref, 'refs/tags/v') && needs.apk.outputs.signed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION_NAME: ${{ needs.apk.outputs.version_name }}
+    steps:
+      - name: Download the APK
+        uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.apk dist/*.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.apk dist/*.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Sharkord $VERSION_NAME" \
+              --generate-notes
+          fi
+
+  fdroid:
+    name: F-Droid repository
+    needs: apk
+    if: needs.apk.outputs.signed == 'true' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_to_fdroid))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FDROID_REPO: ${{ vars.FDROID_REPO || format('{0}/fdroid', github.repository_owner) }}
+      FDROID_REPO_BRANCH: ${{ vars.FDROID_REPO_BRANCH || 'gh-pages' }}
+      FDROID_REPO_TOKEN: ${{ secrets.FDROID_REPO_TOKEN || github.token }}
+      FDROID_KEYSTORE_BASE64: ${{ secrets.FDROID_KEYSTORE_BASE64 }}
+      FDROID_KEYSTORE_PASSWORD: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+      FDROID_KEY_ALIAS: ${{ secrets.FDROID_KEY_ALIAS }}
+      FDROID_KEY_PASSWORD: ${{ secrets.FDROID_KEY_PASSWORD }}
+      APK_NAME: ${{ needs.apk.outputs.apk_name }}
+      VERSION_NAME: ${{ needs.apk.outputs.version_name }}
+      VERSION_CODE: ${{ needs.apk.outputs.version_code }}
+    steps:
+      - name: Download the APK
+        uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: dist
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install fdroidserver
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # fdroidserver reads APK signatures through apksigner from the Android SDK that the
+          # runner image ships, and needs libmagic for the icons it pulls out of the APK
+          sudo apt-get install -y --no-install-recommends libmagic1 pipx
+          pipx install fdroidserver
+
+          # pipx drops the binaries in ~/.local/bin, which is not where the following steps look
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # fdroidserver takes this from the config, and it stops verifying with jarsigner
+          # (which only understands v1 signatures, and AGP no longer writes those)
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          apksigner=""
+          if [[ -d "$sdk/build-tools" ]]; then
+            apksigner="$(find "$sdk/build-tools" -maxdepth 2 -type f -name apksigner | sort -V | tail -1)"
+          fi
+          if [[ -z "$apksigner" ]]; then
+            echo "::error::no apksigner under $sdk/build-tools, fdroidserver would reject the APK"
+            exit 1
+          fi
+          echo "APKSIGNER=$apksigner" >> "$GITHUB_ENV"
+
+          fdroid --version
+
+      - name: Check out the F-Droid repository
+        run: |
+          set -euo pipefail
+          : "${FDROID_REPO_TOKEN:?FDROID_REPO_TOKEN is required to push the repository}"
+
+          # the token goes into a header instead of the URL so it cannot end up in the log
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$FDROID_REPO_TOKEN" | base64 -w0)"
+          remote="https://github.com/${FDROID_REPO}.git"
+
+          git -c http.extraheader="$auth" clone "$remote" fdroid-repo
+          cd fdroid-repo
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git rev-parse --verify --quiet "refs/remotes/origin/$FDROID_REPO_BRANCH" > /dev/null; then
+            git checkout -B "$FDROID_REPO_BRANCH" "origin/$FDROID_REPO_BRANCH"
+          else
+            # first run: the branch starts from an empty tree, so nothing from the app sources
+            # (when the repository doubles as the app repository) ends up in the published index
+            git checkout --orphan "$FDROID_REPO_BRANCH"
+            git rm -r --cached . > /dev/null
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          fi
+
+      - name: Publish the APK
+        run: |
+          set -euo pipefail
+          cd fdroid-repo
+
+          : "${FDROID_KEYSTORE_BASE64:?FDROID_KEYSTORE_BASE64 is required to sign the repository}"
+
+          # the passwords only ever live in the secrets, so the configuration is rebuilt on every
+          # run. The signing material and the scratch directories fdroidserver writes stay out of
+          # the branch; what is published is the APKs, the icons, the metadata and the signed index.
+          printf 'config.yml\nkeystore.p12\n*.jks\n*.keystore\nsrclibs/\ntmp/\nrepo/status/\nrepo/diff/\n' > .gitignore
+          git rm --cached --ignore-unmatch config.yml keystore.p12 > /dev/null 2>&1 || true
+
+          printf '%s' "$FDROID_KEYSTORE_BASE64" | base64 -d > keystore.p12
+          {
+            # fdroidserver refuses a repo_url that does not point at the repo directory
+            printf 'repo_url: https://%s.github.io/%s/repo\n' "${FDROID_REPO%%/*}" "${FDROID_REPO##*/}"
+            printf 'repo_name: Sharkord\n'
+            printf 'repo_description: Sharkord releases. Unofficial client for Android.\n'
+            printf 'sdk_path: %s\n' "${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+            printf 'apksigner: %s\n' "$APKSIGNER"
+            printf 'keystore: keystore.p12\n'
+            printf 'keystorepass: %s\n' "$FDROID_KEYSTORE_PASSWORD"
+            printf 'repo_keyalias: %s\n' "${FDROID_KEY_ALIAS:-sharkord}"
+            printf 'keypass: %s\n' "${FDROID_KEY_PASSWORD:-$FDROID_KEYSTORE_PASSWORD}"
+            printf 'archive_older: 0\n'
+          } > config.yml
+
+          if [[ ! -f metadata/com.sharkord.app.yml ]]; then
+            mkdir -p metadata
+            {
+              printf 'AutoName: Sharkord\n'
+              printf 'Categories:\n'
+              printf '  - Internet\n'
+              printf 'License: MIT\n'
+              printf 'AuthorName: Sharkord Team\n'
+              printf 'Summary: Unofficial Sharkord client, text chat and voice calls\n'
+              printf 'Description: |-\n'
+              printf '  An unofficial client for a Sharkord server: text channels, direct messages\n'
+              printf '  and voice calls.\n'
+              printf 'SourceCode: https://github.com/Rostezkiy/sharkord-android\n'
+              printf 'IssueTracker: https://github.com/Rostezkiy/sharkord-android/issues\n'
+              printf 'AutoUpdateMode: None\n'
+              printf 'UpdateCheckMode: None\n'
+            } > metadata/com.sharkord.app.yml
+          fi
+
+          mkdir -p repo
+          cp "../dist/$APK_NAME" repo/
+          # rename-apks gives every APK the <package>_<versionCode>.apk name the index expects
+          chmod 600 config.yml keystore.p12
+          fdroid update --create-metadata --rename-apks --verbose
+
+          # fdroidserver archives an APK it cannot verify instead of failing, which would leave
+          # the repository empty while the job still looks green
+          if ! ls repo/com.sharkord.app_*.apk > /dev/null 2>&1; then
+            echo "::error::fdroidserver did not publish the APK, see its log above for the reason"
+            exit 1
+          fi
+
+      - name: Push the F-Droid repository
+        run: |
+          set -euo pipefail
+          cd fdroid-repo
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$FDROID_REPO_TOKEN" | base64 -w0)"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'the repository already lists this version'
+            exit 0
+          fi
+
+          git commit -m "Sharkord $VERSION_NAME ($VERSION_CODE)"
+          git -c http.extraheader="$auth" push origin "HEAD:refs/heads/$FDROID_REPO_BRANCH"
+
+      - name: Summarise
+        run: |
+          owner="${FDROID_REPO%%/*}"
+          repo="${FDROID_REPO##*/}"
+          {
+            echo "### F-Droid repository"
+            echo
+            echo "\`$APK_NAME\` published to \`$FDROID_REPO\` on \`$FDROID_REPO_BRANCH\`."
+            echo
+            echo "Add this URL to the F-Droid client: https://${owner}.github.io/${repo}/"
+          } >> "$GITHUB_STEP_SUMMARY"
