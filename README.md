@@ -50,13 +50,6 @@ gitignored.
 Android asks for the microphone the first time a voice channel is joined. The launcher icons are
 generated from the artwork in `assets/icon/` with `dart run flutter_launcher_icons`.
 
-## Continuous integration
-
-`.github/workflows/android.yml` runs the analyzer and the tests, builds the release APK, attaches it
-to a GitHub release for a `v*` tag, and publishes it to a self-hosted F-Droid repository served by
-GitHub Pages. See [docs/fdroid-repo.md](docs/fdroid-repo.md) for the signing keys and the one-time
-setup.
-
 ## Tests
 
 ```bash
