@@ -17,7 +17,8 @@ included.
 - Automatic reconnect that restores the session and the current call state
 
 
-| <img width="250" src="https://github.com/user-attachments/assets/842f9d8c-aabd-4779-8d0b-a71cdc734deb" /> | <img width="250" src="https://github.com/user-attachments/assets/cd7ebec1-27e1-4b9c-9094-0d104b4bb79e" /> | <img width="250" src="https://github.com/user-attachments/assets/3334a7e3-ad63-4981-9b46-658412cfc782" /> |
+| <img width="250" src="https://github.com/user-attachments/assets/842f9d8c-aabd-4779-8d0b-a71cdc734deb" /> | <img width="250" src="https://github.com/user-attachments/assets/cd7ebec1-27e1-4b9c-9094-0d104b4bb79e" /> | <img width="250" height="1210" alt="2026-10-23_00-28" src="https://github.com/user-attachments/assets/385921af-10c4-4af3-a50e-fde02775fb4b" />
+
 
 ## Requirements
 
